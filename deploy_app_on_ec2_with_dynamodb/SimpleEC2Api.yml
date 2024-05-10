@@ -1,0 +1,126 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Stack to create an EC2 instance with a DynamoDB backend in python with flex.
+
+Parameters:
+  KeyPairName:
+    Description: Name of the EC2 Key Pair to enable SSH access to the instance.
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair.
+  ImageID:
+    Description: AMI ID to be used for the EC2 instance.
+    Type: AWS::EC2::Image::Id
+    Default: ami-04b70fa74e45c3917
+
+Resources:
+  SalesSql:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SalesSql
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ec2.amazonaws.com]
+            Action: ["sts:AssumeRole"]
+      Policies:
+        - PolicyName: AccessDynamoDB
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:Scan"
+                  - "dynamodb:Query"
+                  - "dynamodb:PutItem"
+                  - "dynamodb:UpdateItem"
+                  - "dynamodb:DeleteItem"
+                Resource: !GetAtt SalesSql.Arn
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: !Ref ImageID
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroups:
+        - !Ref InstanceSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo apt update
+          sudo apt install python3-pip -y
+          sudo apt install python3-venv -y
+          python3 -m venv testacy
+          source testacy/bin/activate
+          pip3 install flask boto3
+          cat <<EOF > /home/ubuntu/app.py
+          from flask import Flask, jsonify, request
+          import boto3
+          app = Flask(__name__)
+          aws_region = '${AWS::Region}'
+          dynamodb = boto3.resource('dynamodb', region_name=aws_region)
+          table_name = 'SalesSql'
+          table = dynamodb.Table(table_name)
+          @app.route('/')
+          def hello_world():
+              return 'Hello, World!'
+          @app.route('/get_all_items', methods=['GET'])
+          def get_all_items():
+              response = table.scan()
+              items = response['Items']
+              while 'LastEvaluatedKey' in response:
+                  response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+                  items.extend(response['Items'])
+              return jsonify(items)
+          @app.route('/save_item', methods=['POST'])
+          def save_item():
+              item_data = request.json
+              response = table.put_item(Item=item_data)
+              return jsonify({'message': 'Item created successfully', 'item': item_data})
+          if __name__ == '__main__':
+              app.run(host='0.0.0.0')
+          EOF
+          python3 /home/ubuntu/app.py &
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow access to port 5000
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          CidrIp: 0.0.0.0/0
+
+Outputs:
+  HelloWorldEndpoint:
+    Description: Endpoint to say hello
+    Value: !Sub "curl http://${EC2Instance.PublicIp}:5000/"
+  GetAllItemsEndpoint:
+    Description: Endpoint to retrieve all items from DynamoDB
+    Value: !Sub "curl http://${EC2Instance.PublicIp}:5000/get_all_items"
+  SaveItemEndpoint:
+    Description: Endpoint to save an item to DynamoDB
+    Value: !Sub "curl -X POST -d '{\"id\":\"123\", \"name\":\"item-name\"}' http://${EC2Instance.PublicIp}:5000/save_item"
